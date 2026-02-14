@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -31,7 +32,7 @@ use crate::workspace::{
     reciprocal_rank_fusion,
 };
 
-use super::libsql_migrations;
+use crate::db::libsql_migrations;
 
 /// Explicit column list for routines table (matches positional access in `row_to_routine_libsql`).
 const ROUTINE_COLUMNS: &str = "\
@@ -48,8 +49,12 @@ const ROUTINE_RUN_COLUMNS: &str = "\
     status, completed_at, result_summary, tokens_used, job_id, created_at";
 
 /// libSQL/Turso database backend.
+///
+/// Stores the `Database` handle in an `Arc` so that the same underlying
+/// database can be shared with stores (SecretsStore, WasmToolStore) that
+/// create their own connections per-operation.
 pub struct LibSqlBackend {
-    db: LibSqlDatabase,
+    db: Arc<LibSqlDatabase>,
 }
 
 impl LibSqlBackend {
@@ -67,7 +72,7 @@ impl LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Pool(format!("Failed to open libSQL database: {}", e)))?;
 
-        Ok(Self { db })
+        Ok(Self { db: Arc::new(db) })
     }
 
     /// Create a new in-memory database (for testing).
@@ -79,7 +84,7 @@ impl LibSqlBackend {
                 DatabaseError::Pool(format!("Failed to create in-memory database: {}", e))
             })?;
 
-        Ok(Self { db })
+        Ok(Self { db: Arc::new(db) })
     }
 
     /// Create with Turso cloud sync (embedded replica).
@@ -99,18 +104,18 @@ impl LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Pool(format!("Failed to open remote replica: {}", e)))?;
 
-        Ok(Self { db })
+        Ok(Self { db: Arc::new(db) })
     }
 
-    /// Get the underlying database handle (for sync operations).
-    pub fn database(&self) -> &LibSqlDatabase {
-        &self.db
-    }
-
-    /// Create a new connection to the same database.
+    /// Get a shared reference to the underlying database handle.
     ///
-    /// Used for creating separate connections for SecretsStore and WasmToolStore
-    /// which have their own connection needs.
+    /// Use this to pass the database to stores (SecretsStore, WasmToolStore)
+    /// that need to create their own connections per-operation.
+    pub fn shared_db(&self) -> Arc<LibSqlDatabase> {
+        Arc::clone(&self.db)
+    }
+
+    /// Create a new connection to the database.
     pub fn connect(&self) -> Result<Connection, DatabaseError> {
         self.db
             .connect()

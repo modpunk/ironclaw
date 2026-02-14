@@ -567,15 +567,24 @@ fn row_to_tool(row: &tokio_postgres::Row) -> Result<StoredWasmTool, WasmStorageE
 // ==================== libSQL implementation ====================
 
 /// libSQL/Turso implementation of WasmToolStore.
+///
+/// Holds an `Arc<Database>` handle and creates a fresh connection per operation,
+/// matching the connection-per-request pattern used by the main `LibSqlBackend`.
 #[cfg(feature = "libsql")]
 pub struct LibSqlWasmToolStore {
-    conn: libsql::Connection,
+    db: std::sync::Arc<libsql::Database>,
 }
 
 #[cfg(feature = "libsql")]
 impl LibSqlWasmToolStore {
-    pub fn new(conn: libsql::Connection) -> Self {
-        Self { conn }
+    pub fn new(db: std::sync::Arc<libsql::Database>) -> Self {
+        Self { db }
+    }
+
+    fn connect(&self) -> Result<libsql::Connection, WasmStorageError> {
+        self.db
+            .connect()
+            .map_err(|e| WasmStorageError::Database(format!("Connection failed: {}", e)))
     }
 }
 
@@ -589,9 +598,15 @@ impl WasmToolStore for LibSqlWasmToolStore {
         let schema_str = serde_json::to_string(&params.parameters_schema)
             .map_err(|e| WasmStorageError::InvalidData(e.to_string()))?;
 
-        self.conn
-            .execute(
-                r#"
+        // Wrap INSERT + read-back in a transaction to prevent TOCTOU races
+        let conn = self.connect()?;
+        let tx = conn
+            .transaction()
+            .await
+            .map_err(|e| WasmStorageError::Database(e.to_string()))?;
+
+        tx.execute(
+            r#"
                 INSERT INTO wasm_tools (
                     id, user_id, name, version, description, wasm_binary, binary_hash,
                     parameters_schema, source_url, trust_level, status, created_at, updated_at
@@ -605,26 +620,25 @@ impl WasmToolStore for LibSqlWasmToolStore {
                     source_url = excluded.source_url,
                     updated_at = ?11
                 "#,
-                libsql::params![
-                    id.to_string(),
-                    params.user_id.as_str(),
-                    params.name.as_str(),
-                    params.version.as_str(),
-                    params.description.as_str(),
-                    libsql::Value::Blob(params.wasm_binary),
-                    libsql::Value::Blob(binary_hash),
-                    schema_str.as_str(),
-                    libsql_wasm_opt_text(params.source_url.as_deref()),
-                    params.trust_level.to_string(),
-                    now.as_str(),
-                ],
-            )
-            .await
-            .map_err(|e| WasmStorageError::Database(e.to_string()))?;
+            libsql::params![
+                id.to_string(),
+                params.user_id.as_str(),
+                params.name.as_str(),
+                params.version.as_str(),
+                params.description.as_str(),
+                libsql::Value::Blob(params.wasm_binary),
+                libsql::Value::Blob(binary_hash),
+                schema_str.as_str(),
+                libsql_wasm_opt_text(params.source_url.as_deref()),
+                params.trust_level.to_string(),
+                now.as_str(),
+            ],
+        )
+        .await
+        .map_err(|e| WasmStorageError::Database(e.to_string()))?;
 
-        // Read back the row
-        let mut rows = self
-            .conn
+        // Read back the row within the same transaction
+        let mut rows = tx
             .query(
                 r#"
                 SELECT id, user_id, name, version, description, parameters_schema,
@@ -647,12 +661,18 @@ impl WasmToolStore for LibSqlWasmToolStore {
                 WasmStorageError::Database("Insert succeeded but row not found".into())
             })?;
 
-        libsql_row_to_tool(&row)
+        let tool = libsql_row_to_tool(&row)?;
+
+        tx.commit()
+            .await
+            .map_err(|e| WasmStorageError::Database(e.to_string()))?;
+
+        Ok(tool)
     }
 
     async fn get(&self, user_id: &str, name: &str) -> Result<StoredWasmTool, WasmStorageError> {
-        let mut rows = self
-            .conn
+        let conn = self.connect()?;
+        let mut rows = conn
             .query(
                 r#"
                 SELECT id, user_id, name, version, description, parameters_schema,
@@ -689,8 +709,8 @@ impl WasmToolStore for LibSqlWasmToolStore {
         user_id: &str,
         name: &str,
     ) -> Result<StoredWasmToolWithBinary, WasmStorageError> {
-        let mut rows = self
-            .conn
+        let conn = self.connect()?;
+        let mut rows = conn
             .query(
                 r#"
                 SELECT id, user_id, name, version, description, wasm_binary, binary_hash,
@@ -748,8 +768,8 @@ impl WasmToolStore for LibSqlWasmToolStore {
         &self,
         tool_id: Uuid,
     ) -> Result<Option<StoredCapabilities>, WasmStorageError> {
-        let mut rows = self
-            .conn
+        let conn = self.connect()?;
+        let mut rows = conn
             .query(
                 r#"
                 SELECT id, wasm_tool_id, http_allowlist, allowed_secrets, tool_aliases,
@@ -818,8 +838,8 @@ impl WasmToolStore for LibSqlWasmToolStore {
 
     async fn list(&self, user_id: &str) -> Result<Vec<StoredWasmTool>, WasmStorageError> {
         // SQLite doesn't have DISTINCT ON, so we use a subquery to get latest version per name
-        let mut rows = self
-            .conn
+        let conn = self.connect()?;
+        let mut rows = conn
             .query(
                 r#"
                 SELECT id, user_id, name, version, description, parameters_schema,
@@ -857,9 +877,9 @@ impl WasmToolStore for LibSqlWasmToolStore {
         status: ToolStatus,
     ) -> Result<(), WasmStorageError> {
         let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let conn = self.connect()?;
 
-        let result = self
-            .conn
+        let result = conn
             .execute(
                 "UPDATE wasm_tools SET status = ?1, updated_at = ?2 WHERE user_id = ?3 AND name = ?4",
                 libsql::params![status.to_string(), now.as_str(), user_id, name],
@@ -875,8 +895,8 @@ impl WasmToolStore for LibSqlWasmToolStore {
     }
 
     async fn delete(&self, user_id: &str, name: &str) -> Result<bool, WasmStorageError> {
-        let result = self
-            .conn
+        let conn = self.connect()?;
+        let result = conn
             .execute(
                 "DELETE FROM wasm_tools WHERE user_id = ?1 AND name = ?2",
                 libsql::params![user_id, name],

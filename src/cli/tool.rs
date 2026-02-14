@@ -748,11 +748,9 @@ async fn auth_tool(name: String, dir: Option<PathBuf>, user_id: String) -> anyho
                 .unwrap_or(&default_path);
 
             let backend = if let Some(ref url) = config.database.libsql_url {
-                let token = config
-                    .database
-                    .libsql_auth_token
-                    .as_ref()
-                    .expect("LIBSQL_AUTH_TOKEN required when LIBSQL_URL is set");
+                let token = config.database.libsql_auth_token.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("LIBSQL_AUTH_TOKEN is required when LIBSQL_URL is set")
+                })?;
                 LibSqlBackend::new_remote_replica(db_path, url, token.expose_secret())
                     .await
                     .map_err(|e| anyhow::anyhow!("{}", e))?
@@ -766,10 +764,8 @@ async fn auth_tool(name: String, dir: Option<PathBuf>, user_id: String) -> anyho
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            let conn = backend.connect().map_err(|e| anyhow::anyhow!("{}", e))?;
-
             Arc::new(crate::secrets::LibSqlSecretsStore::new(
-                conn,
+                backend.shared_db(),
                 Arc::new(crypto),
             ))
         }

@@ -307,17 +307,26 @@ fn row_to_secret(row: &tokio_postgres::Row) -> Secret {
 // ==================== libSQL implementation ====================
 
 /// libSQL/Turso implementation of SecretsStore.
+///
+/// Holds an `Arc<Database>` handle and creates a fresh connection per operation,
+/// matching the connection-per-request pattern used by the main `LibSqlBackend`.
 #[cfg(feature = "libsql")]
 pub struct LibSqlSecretsStore {
-    conn: libsql::Connection,
+    db: Arc<libsql::Database>,
     crypto: Arc<SecretsCrypto>,
 }
 
 #[cfg(feature = "libsql")]
 impl LibSqlSecretsStore {
-    /// Create a new store with the given libsql connection and crypto instance.
-    pub fn new(conn: libsql::Connection, crypto: Arc<SecretsCrypto>) -> Self {
-        Self { conn, crypto }
+    /// Create a new store with the given shared libsql database handle and crypto instance.
+    pub fn new(db: Arc<libsql::Database>, crypto: Arc<SecretsCrypto>) -> Self {
+        Self { db, crypto }
+    }
+
+    fn connect(&self) -> Result<libsql::Connection, SecretError> {
+        self.db
+            .connect()
+            .map_err(|e| SecretError::Database(format!("Connection failed: {}", e)))
     }
 }
 
@@ -340,8 +349,8 @@ impl SecretsStore for LibSqlSecretsStore {
             .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
 
         // Start transaction for atomic upsert + read-back
-        let tx = self
-            .conn
+        let conn = self.connect()?;
+        let tx = conn
             .transaction()
             .await
             .map_err(|e| SecretError::Database(e.to_string()))?;
@@ -401,8 +410,8 @@ impl SecretsStore for LibSqlSecretsStore {
     }
 
     async fn get(&self, user_id: &str, name: &str) -> Result<Secret, SecretError> {
-        let mut rows = self
-            .conn
+        let conn = self.connect()?;
+        let mut rows = conn
             .query(
                 r#"
                 SELECT id, user_id, name, encrypted_value, key_salt, provider, expires_at,
@@ -446,8 +455,8 @@ impl SecretsStore for LibSqlSecretsStore {
     }
 
     async fn exists(&self, user_id: &str, name: &str) -> Result<bool, SecretError> {
-        let mut rows = self
-            .conn
+        let conn = self.connect()?;
+        let mut rows = conn
             .query(
                 "SELECT 1 FROM secrets WHERE user_id = ?1 AND name = ?2",
                 libsql::params![user_id, name],
@@ -463,8 +472,8 @@ impl SecretsStore for LibSqlSecretsStore {
     }
 
     async fn list(&self, user_id: &str) -> Result<Vec<SecretRef>, SecretError> {
-        let mut rows = self
-            .conn
+        let conn = self.connect()?;
+        let mut rows = conn
             .query(
                 "SELECT name, provider FROM secrets WHERE user_id = ?1 ORDER BY name",
                 libsql::params![user_id],
@@ -487,8 +496,8 @@ impl SecretsStore for LibSqlSecretsStore {
     }
 
     async fn delete(&self, user_id: &str, name: &str) -> Result<bool, SecretError> {
-        let affected = self
-            .conn
+        let conn = self.connect()?;
+        let affected = conn
             .execute(
                 "DELETE FROM secrets WHERE user_id = ?1 AND name = ?2",
                 libsql::params![user_id, name],
@@ -501,18 +510,18 @@ impl SecretsStore for LibSqlSecretsStore {
 
     async fn record_usage(&self, secret_id: Uuid) -> Result<(), SecretError> {
         let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let conn = self.connect()?;
 
-        self.conn
-            .execute(
-                r#"
+        conn.execute(
+            r#"
                 UPDATE secrets
                 SET last_used_at = ?1, usage_count = usage_count + 1
                 WHERE id = ?2
                 "#,
-                libsql::params![now.as_str(), secret_id.to_string()],
-            )
-            .await
-            .map_err(|e| SecretError::Database(e.to_string()))?;
+            libsql::params![now.as_str(), secret_id.to_string()],
+        )
+        .await
+        .map_err(|e| SecretError::Database(e.to_string()))?;
 
         Ok(())
     }

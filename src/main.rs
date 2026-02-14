@@ -38,6 +38,8 @@ use ironclaw::{
     workspace::{EmbeddingProvider, NearAiEmbeddings, OpenAiEmbeddings, Workspace},
 };
 
+#[cfg(feature = "libsql")]
+use ironclaw::secrets::LibSqlSecretsStore;
 #[cfg(feature = "postgres")]
 use ironclaw::secrets::PostgresSecretsStore;
 use ironclaw::secrets::SecretsCrypto;
@@ -344,12 +346,12 @@ async fn main() -> anyhow::Result<()> {
     //
     // NOTE: For simpler call sites (CLI commands, Memory handler) use the shared
     // helper `ironclaw::db::connect_from_config()`. This block is kept inline
-    // because it also captures backend-specific handles (`pg_pool`, `libsql_conn`)
+    // because it also captures backend-specific handles (`pg_pool`, `libsql_db`)
     // needed by the secrets store.
     #[cfg(feature = "postgres")]
     let mut pg_pool: Option<deadpool_postgres::Pool> = None;
     #[cfg(feature = "libsql")]
-    let mut libsql_conn: Option<libsql::Connection> = None;
+    let mut libsql_db: Option<std::sync::Arc<libsql::Database>> = None;
 
     let db: Option<Arc<dyn ironclaw::db::Database>> = if cli.no_db {
         tracing::warn!("Running without database connection");
@@ -370,11 +372,9 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or(&default_path);
 
                 let backend = if let Some(ref url) = config.database.libsql_url {
-                    let token = config
-                        .database
-                        .libsql_auth_token
-                        .as_ref()
-                        .expect("LIBSQL_AUTH_TOKEN required when LIBSQL_URL is set");
+                    let token = config.database.libsql_auth_token.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("LIBSQL_AUTH_TOKEN is required when LIBSQL_URL is set")
+                    })?;
                     LibSqlBackend::new_remote_replica(db_path, url, token.expose_secret()).await?
                 } else {
                     LibSqlBackend::new_local(db_path).await?
@@ -382,8 +382,8 @@ async fn main() -> anyhow::Result<()> {
                 backend.run_migrations().await?;
                 tracing::info!("libSQL database connected and migrations applied");
 
-                // Capture an extra connection for SecretsStore / WasmToolStore
-                libsql_conn = Some(backend.connect().map_err(|e| anyhow::anyhow!("{}", e))?);
+                // Capture the Database handle for SecretsStore (connection-per-op)
+                libsql_db = Some(backend.shared_db());
 
                 Some(Arc::new(backend) as Arc<dyn ironclaw::db::Database>)
             }
@@ -516,47 +516,48 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Builder mode enabled");
     }
 
-    // Create secrets store if master key is configured (needed for MCP auth and WASM channels)
-    let secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>> = {
-        #[cfg(feature = "postgres")]
-        {
-            if let (Some(pool), Some(master_key)) = (&pg_pool, config.secrets.master_key()) {
-                match SecretsCrypto::new(master_key.clone()) {
-                    Ok(crypto) => Some(Arc::new(PostgresSecretsStore::new(
-                        pool.clone(),
-                        Arc::new(crypto),
-                    ))),
-                    Err(e) => {
-                        tracing::warn!("Failed to initialize secrets crypto: {}", e);
-                        None
-                    }
+    // Create secrets store if master key is configured (needed for MCP auth and WASM channels).
+    //
+    // When both `postgres` and `libsql` features are compiled, the runtime-selected
+    // backend determines which store is created: whichever DB init branch ran will
+    // have set its handle (pg_pool or libsql_db), and the or_else chain picks it up.
+    let secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>> =
+        if let Some(master_key) = config.secrets.master_key() {
+            match SecretsCrypto::new(master_key.clone()) {
+                Ok(crypto) => {
+                    let crypto = Arc::new(crypto);
+                    let store: Option<Arc<dyn SecretsStore + Send + Sync>> = None;
+
+                    #[cfg(feature = "libsql")]
+                    let store = store.or_else(|| {
+                        libsql_db.take().map(|db| {
+                            Arc::new(LibSqlSecretsStore::new(db, Arc::clone(&crypto)))
+                                as Arc<dyn SecretsStore + Send + Sync>
+                        })
+                    });
+
+                    #[cfg(feature = "postgres")]
+                    let store = store.or_else(|| {
+                        pg_pool.as_ref().map(|pool| {
+                            Arc::new(PostgresSecretsStore::new(pool.clone(), Arc::clone(&crypto)))
+                                as Arc<dyn SecretsStore + Send + Sync>
+                        })
+                    });
+
+                    store
                 }
-            } else {
-                None
-            }
-        }
-        #[cfg(all(feature = "libsql", not(feature = "postgres")))]
-        {
-            if let (Some(conn), Some(master_key)) =
-                (libsql_conn.take(), config.secrets.master_key())
-            {
-                match SecretsCrypto::new(master_key.clone()) {
-                    Ok(crypto) => Some(Arc::new(LibSqlSecretsStore::new(conn, Arc::new(crypto)))
-                        as Arc<dyn SecretsStore + Send + Sync>),
-                    Err(e) => {
-                        tracing::warn!("Failed to initialize secrets crypto: {}", e);
-                        None
-                    }
+                Err(e) => {
+                    tracing::warn!("Failed to initialize secrets crypto: {}", e);
+                    #[cfg(feature = "libsql")]
+                    let _ = libsql_db.take();
+                    None
                 }
-            } else {
-                None
             }
-        }
-        #[cfg(not(any(feature = "postgres", feature = "libsql")))]
-        {
+        } else {
+            #[cfg(feature = "libsql")]
+            let _ = libsql_db.take();
             None
-        }
-    };
+        };
 
     let mcp_session_manager = Arc::new(McpSessionManager::new());
 

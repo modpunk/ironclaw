@@ -530,11 +530,9 @@ async fn get_secrets_store() -> anyhow::Result<Arc<dyn SecretsStore + Send + Syn
             .unwrap_or(&default_path);
 
         let backend = if let Some(ref url) = config.database.libsql_url {
-            let token = config
-                .database
-                .libsql_auth_token
-                .as_ref()
-                .expect("LIBSQL_AUTH_TOKEN required when LIBSQL_URL is set");
+            let token = config.database.libsql_auth_token.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("LIBSQL_AUTH_TOKEN is required when LIBSQL_URL is set")
+            })?;
             LibSqlBackend::new_remote_replica(db_path, url, token.expose_secret())
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?
@@ -548,10 +546,8 @@ async fn get_secrets_store() -> anyhow::Result<Arc<dyn SecretsStore + Send + Syn
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-        let conn = backend.connect().map_err(|e| anyhow::anyhow!("{}", e))?;
-
         return Ok(Arc::new(crate::secrets::LibSqlSecretsStore::new(
-            conn,
+            backend.shared_db(),
             Arc::new(crypto),
         )));
     }

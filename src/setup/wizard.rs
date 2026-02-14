@@ -803,11 +803,8 @@ impl SetupWizard {
         crypto: &Arc<SecretsCrypto>,
     ) -> Result<Option<Arc<dyn SecretsStore>>, SetupError> {
         if let Some(ref backend) = self.db_backend {
-            let conn = backend
-                .connect()
-                .map_err(|e| SetupError::Database(format!("Failed to create connection: {}", e)))?;
             let store: Arc<dyn SecretsStore> = Arc::new(crate::secrets::LibSqlSecretsStore::new(
-                conn,
+                backend.shared_db(),
                 Arc::clone(crypto),
             ));
             Ok(Some(store))
@@ -1136,6 +1133,7 @@ impl Default for SetupWizard {
 }
 
 /// Mask password in a database URL for display.
+#[cfg(feature = "postgres")]
 fn mask_password_in_url(url: &str) -> String {
     // URL format: scheme://user:password@host/database
     // Find "://" to locate start of credentials
@@ -1326,6 +1324,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "postgres")]
     fn test_mask_password_in_url() {
         assert_eq!(
             mask_password_in_url("postgres://user:secret@localhost/db"),
