@@ -909,6 +909,13 @@ fn send_pairing_reply(chat_id: i64, code: &str) -> Result<(), String> {
 /// 1. Call getFile to get the file_path.
 /// 2. Download the file bytes from /file/bot{TOKEN}/{file_path}.
 fn download_voice_file(file_id: &str) -> Result<Vec<u8>, String> {
+    // Reject file_id containing curly braces to prevent credential placeholder
+    // injection (e.g., a malicious file_id like "{OPENAI_API_KEY}" would be
+    // interpreted by the host-side credential injector).
+    if file_id.contains('{') || file_id.contains('}') {
+        return Err("invalid file_id: contains forbidden characters".to_string());
+    }
+
     // Step 1: Call getFile to get file_path
     // Double braces `{{...}}` produce a literal `{TELEGRAM_BOT_TOKEN}` placeholder
     // in the URL, which the host-side credential injector replaces with the real token.
@@ -947,6 +954,11 @@ fn download_voice_file(file_id: &str) -> Result<Vec<u8>, String> {
     let file_path = file
         .file_path
         .ok_or_else(|| "getFile returned no file_path".to_string())?;
+
+    // Sanitize file_path against credential placeholder injection
+    if file_path.contains('{') || file_path.contains('}') {
+        return Err("invalid file_path: contains forbidden characters".to_string());
+    }
 
     // Step 2: Download the actual file bytes
     let download_url = format!(

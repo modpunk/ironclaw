@@ -1533,31 +1533,12 @@ impl WasmChannel {
                 });
             }
 
-            // Convert to IncomingMessage
-            let mut msg = IncomingMessage::new(&self.name, &emitted.user_id, &emitted.content);
-
-            if let Some(name) = emitted.user_name {
-                msg = msg.with_user_name(name);
-            }
-
-            if let Some(thread_id) = emitted.thread_id {
-                msg = msg.with_thread(thread_id);
-            }
-
-            // Parse metadata JSON
-            if let Ok(metadata) = serde_json::from_str(&emitted.metadata_json) {
-                msg = msg.with_metadata(metadata);
-            }
-
-            // Carry attachments through (moves emitted.attachments into msg)
-            if !emitted.attachments.is_empty() {
-                msg = msg.with_attachments(emitted.attachments);
-            }
-
-            // Apply transcription middleware if available (may replace content with transcript)
-            if let Some(ref middleware) = self.transcription_middleware {
-                msg = middleware.process(msg).await;
-            }
+            let msg = Self::convert_emitted_to_incoming(
+                &self.name,
+                emitted,
+                self.transcription_middleware.as_deref(),
+            )
+            .await;
 
             // Send to stream (log post-transcription state intentionally)
             tracing::info!(
@@ -1791,31 +1772,9 @@ impl WasmChannel {
                 });
             }
 
-            // Convert to IncomingMessage
-            let mut msg = IncomingMessage::new(channel_name, &emitted.user_id, &emitted.content);
-
-            if let Some(name) = emitted.user_name {
-                msg = msg.with_user_name(name);
-            }
-
-            if let Some(thread_id) = emitted.thread_id {
-                msg = msg.with_thread(thread_id);
-            }
-
-            // Parse metadata JSON
-            if let Ok(metadata) = serde_json::from_str(&emitted.metadata_json) {
-                msg = msg.with_metadata(metadata);
-            }
-
-            // Carry attachments through (moves emitted.attachments into msg)
-            if !emitted.attachments.is_empty() {
-                msg = msg.with_attachments(emitted.attachments);
-            }
-
-            // Apply transcription middleware if available (may replace content with transcript)
-            if let Some(middleware) = transcription_middleware {
-                msg = middleware.process(msg).await;
-            }
+            let msg =
+                Self::convert_emitted_to_incoming(channel_name, emitted, transcription_middleware)
+                    .await;
 
             // Send to stream (log post-transcription state intentionally)
             tracing::info!(
@@ -1840,6 +1799,65 @@ impl WasmChannel {
         }
 
         Ok(())
+    }
+
+    /// Convert an `EmittedMessage` to an `IncomingMessage`, applying transcription
+    /// middleware with a timeout if available.
+    ///
+    /// Shared by both `process_emitted_messages` (HTTP callback path) and
+    /// `dispatch_emitted_messages` (polling path) to avoid duplication.
+    async fn convert_emitted_to_incoming(
+        channel_name: &str,
+        emitted: EmittedMessage,
+        transcription_middleware: Option<&crate::transcription::TranscriptionMiddleware>,
+    ) -> IncomingMessage {
+        // Save user_id before partial moves for potential timeout fallback
+        let user_id = emitted.user_id.clone();
+
+        let mut msg = IncomingMessage::new(channel_name, &emitted.user_id, &emitted.content);
+
+        if let Some(name) = emitted.user_name {
+            msg = msg.with_user_name(name);
+        }
+
+        if let Some(thread_id) = emitted.thread_id {
+            msg = msg.with_thread(thread_id);
+        }
+
+        // Parse metadata JSON
+        if let Ok(metadata) = serde_json::from_str(&emitted.metadata_json) {
+            msg = msg.with_metadata(metadata);
+        }
+
+        // Carry attachments through (moves emitted.attachments into msg)
+        if !emitted.attachments.is_empty() {
+            msg = msg.with_attachments(emitted.attachments);
+        }
+
+        // Apply transcription middleware with a 30-second timeout to prevent
+        // a slow/hanging provider from blocking the message pipeline indefinitely.
+        if let Some(middleware) = transcription_middleware {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), middleware.process(msg))
+                .await
+            {
+                Ok(processed) => return processed,
+                Err(_) => {
+                    tracing::error!(
+                        channel = %channel_name,
+                        "Transcription timed out after 30s, delivering message without transcript"
+                    );
+                    // Timeout: `msg` was moved into the timed-out future, so
+                    // reconstruct a fallback message from the saved user_id.
+                    return IncomingMessage::new(
+                        channel_name,
+                        &user_id,
+                        "[Voice note: transcription timed out]",
+                    );
+                }
+            }
+        }
+
+        msg
     }
 }
 
