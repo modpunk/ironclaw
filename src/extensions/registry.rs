@@ -26,6 +26,26 @@ impl ExtensionRegistry {
         }
     }
 
+    /// Create a new registry merging builtin entries with catalog-provided entries.
+    ///
+    /// Deduplicates by `(name, kind)` pair -- a builtin MCP "slack" and a registry
+    /// WASM "slack" can coexist since they're different kinds.
+    pub fn new_with_catalog(catalog_entries: Vec<RegistryEntry>) -> Self {
+        let mut entries = builtin_entries();
+        for entry in catalog_entries {
+            if !entries
+                .iter()
+                .any(|e| e.name == entry.name && e.kind == entry.kind)
+            {
+                entries.push(entry);
+            }
+        }
+        Self {
+            entries,
+            discovery_cache: RwLock::new(Vec::new()),
+        }
+    }
+
     /// Search the registry by query string. Returns results sorted by relevance.
     ///
     /// Splits the query into lowercase tokens and scores each entry by matches
@@ -250,11 +270,11 @@ fn builtin_entries() -> Vec<RegistryEntry> {
             auth_hint: AuthHint::Dcr,
         },
         RegistryEntry {
-            name: "slack".to_string(),
-            display_name: "Slack".to_string(),
+            name: "slack-mcp".to_string(),
+            display_name: "Slack MCP".to_string(),
             kind: ExtensionKind::McpServer,
             description:
-                "Connect to Slack for messaging, channel management, and team communication"
+                "Connect to Slack via MCP for messaging, channel management, and team communication"
                     .to_string(),
             keywords: vec![
                 "messaging".into(),
@@ -359,6 +379,72 @@ fn builtin_entries() -> Vec<RegistryEntry> {
                 url: "https://mcp.intercom.com".to_string(),
             },
             auth_hint: AuthHint::Dcr,
+        },
+        // -- WASM Channels (bundled) --
+        RegistryEntry {
+            name: "telegram".to_string(),
+            display_name: "Telegram".to_string(),
+            kind: ExtensionKind::WasmChannel,
+            description: "Telegram Bot API channel for receiving and sending messages via Telegram"
+                .to_string(),
+            keywords: vec![
+                "chat".into(),
+                "messaging".into(),
+                "bot".into(),
+                "channel".into(),
+            ],
+            source: ExtensionSource::Bundled {
+                name: "telegram".to_string(),
+            },
+            auth_hint: AuthHint::CapabilitiesAuth,
+        },
+        RegistryEntry {
+            name: "slack".to_string(),
+            display_name: "Slack".to_string(),
+            kind: ExtensionKind::WasmChannel,
+            description: "Slack Events API channel for receiving and sending messages via Slack"
+                .to_string(),
+            keywords: vec![
+                "chat".into(),
+                "messaging".into(),
+                "team".into(),
+                "channel".into(),
+            ],
+            source: ExtensionSource::Bundled {
+                name: "slack".to_string(),
+            },
+            auth_hint: AuthHint::CapabilitiesAuth,
+        },
+        RegistryEntry {
+            name: "discord".to_string(),
+            display_name: "Discord".to_string(),
+            kind: ExtensionKind::WasmChannel,
+            description:
+                "Discord Gateway channel for handling slash commands, buttons, and messages"
+                    .to_string(),
+            keywords: vec![
+                "chat".into(),
+                "messaging".into(),
+                "gaming".into(),
+                "channel".into(),
+            ],
+            source: ExtensionSource::Bundled {
+                name: "discord".to_string(),
+            },
+            auth_hint: AuthHint::CapabilitiesAuth,
+        },
+        RegistryEntry {
+            name: "whatsapp".to_string(),
+            display_name: "WhatsApp".to_string(),
+            kind: ExtensionKind::WasmChannel,
+            description:
+                "WhatsApp Business API channel for receiving and sending WhatsApp messages"
+                    .to_string(),
+            keywords: vec!["chat".into(), "messaging".into(), "channel".into()],
+            source: ExtensionSource::Bundled {
+                name: "whatsapp".to_string(),
+            },
+            auth_hint: AuthHint::CapabilitiesAuth,
         },
     ]
 }
@@ -541,5 +627,120 @@ mod tests {
 
         let results = registry.search("dup").await;
         assert_eq!(results.len(), 1, "Should not duplicate cached entries");
+    }
+
+    #[tokio::test]
+    async fn test_new_with_catalog() {
+        let catalog_entries = vec![
+            RegistryEntry {
+                name: "telegram".to_string(),
+                display_name: "Telegram".to_string(),
+                kind: ExtensionKind::WasmChannel,
+                description: "Telegram Bot API channel".to_string(),
+                keywords: vec!["messaging".into(), "bot".into()],
+                source: ExtensionSource::WasmBuildable {
+                    repo_url: "channels-src/telegram".to_string(),
+                    build_dir: Some("channels-src/telegram".to_string()),
+                },
+                auth_hint: AuthHint::CapabilitiesAuth,
+            },
+            // This shares a name with the builtin slack-mcp but has a different kind, so both should appear
+            RegistryEntry {
+                name: "slack-mcp".to_string(),
+                display_name: "Slack MCP WASM".to_string(),
+                kind: ExtensionKind::WasmTool,
+                description: "Slack WASM tool".to_string(),
+                keywords: vec!["messaging".into()],
+                source: ExtensionSource::WasmBuildable {
+                    repo_url: "tools-src/slack".to_string(),
+                    build_dir: Some("tools-src/slack".to_string()),
+                },
+                auth_hint: AuthHint::CapabilitiesAuth,
+            },
+        ];
+
+        let registry = ExtensionRegistry::new_with_catalog(catalog_entries);
+
+        // Should find the new telegram entry
+        let results = registry.search("telegram").await;
+        assert!(!results.is_empty(), "Should find telegram from catalog");
+        assert_eq!(results[0].entry.name, "telegram");
+
+        // Should have both builtin MCP slack-mcp and catalog WASM slack-mcp
+        let results = registry.search("slack").await;
+        let slack_mcp = results
+            .iter()
+            .any(|r| r.entry.name == "slack-mcp" && r.entry.kind == ExtensionKind::McpServer);
+        let slack_wasm = results
+            .iter()
+            .any(|r| r.entry.name == "slack-mcp" && r.entry.kind == ExtensionKind::WasmTool);
+        assert!(slack_mcp, "Should have builtin MCP slack-mcp");
+        assert!(slack_wasm, "Should have catalog WASM slack-mcp");
+    }
+
+    #[tokio::test]
+    async fn test_new_with_catalog_dedup_same_kind() {
+        // A catalog entry with same name AND kind as a builtin should be skipped
+        let catalog_entries = vec![RegistryEntry {
+            name: "slack-mcp".to_string(),
+            display_name: "Slack MCP Override".to_string(),
+            kind: ExtensionKind::McpServer, // same kind as builtin slack-mcp
+            description: "Should be skipped".to_string(),
+            keywords: vec![],
+            source: ExtensionSource::McpUrl {
+                url: "https://other.slack.com".to_string(),
+            },
+            auth_hint: AuthHint::Dcr,
+        }];
+
+        let registry = ExtensionRegistry::new_with_catalog(catalog_entries);
+
+        let entry = registry.get("slack-mcp").await;
+        assert!(entry.is_some());
+        // Should still be the builtin, not the override
+        assert_eq!(entry.unwrap().display_name, "Slack MCP");
+    }
+
+    #[tokio::test]
+    async fn test_search_finds_telegram_channel() {
+        let registry = ExtensionRegistry::new();
+        let results = registry.search("telegram").await;
+
+        assert!(!results.is_empty(), "Should find telegram in registry");
+        assert_eq!(results[0].entry.name, "telegram");
+        assert_eq!(results[0].entry.kind, ExtensionKind::WasmChannel);
+    }
+
+    #[tokio::test]
+    async fn test_search_channel_by_keyword() {
+        let registry = ExtensionRegistry::new();
+        let results = registry.search("bot messaging").await;
+
+        let has_telegram = results.iter().any(|r| r.entry.name == "telegram");
+        assert!(
+            has_telegram,
+            "Telegram should appear in bot messaging search"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_bundled_channels() {
+        let registry = ExtensionRegistry::new();
+
+        let telegram = registry.get("telegram").await;
+        assert!(telegram.is_some());
+        assert_eq!(telegram.unwrap().kind, ExtensionKind::WasmChannel);
+
+        let slack = registry.get("slack").await;
+        assert!(slack.is_some());
+        assert_eq!(slack.unwrap().kind, ExtensionKind::WasmChannel);
+
+        let discord = registry.get("discord").await;
+        assert!(discord.is_some());
+        assert_eq!(discord.unwrap().kind, ExtensionKind::WasmChannel);
+
+        let whatsapp = registry.get("whatsapp").await;
+        assert!(whatsapp.is_some());
+        assert_eq!(whatsapp.unwrap().kind, ExtensionKind::WasmChannel);
     }
 }

@@ -13,7 +13,7 @@ use axum::{
     http::{StatusCode, header},
     middleware,
     response::{
-        Html, IntoResponse,
+        IntoResponse,
         sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post},
@@ -148,6 +148,9 @@ pub struct GatewayState {
     pub skill_catalog: Option<Arc<crate::skills::catalog::SkillCatalog>>,
     /// Rate limiter for chat endpoints (30 messages per 60 seconds).
     pub chat_rate_limiter: RateLimiter,
+    /// Registry catalog entries for the available extensions API.
+    /// Populated at startup from `registry/` manifests, independent of extension manager.
+    pub registry_entries: Vec<crate::extensions::RegistryEntry>,
     /// Cost guard for token/cost tracking.
     pub cost_guard: Option<Arc<crate::agent::cost_guard::CostGuard>>,
     /// Server startup time for uptime calculation.
@@ -218,6 +221,7 @@ pub async fn start_server(
         // Extensions
         .route("/api/extensions", get(extensions_list_handler))
         .route("/api/extensions/tools", get(extensions_tools_handler))
+        .route("/api/extensions/registry", get(extensions_registry_handler))
         .route("/api/extensions/install", post(extensions_install_handler))
         .route(
             "/api/extensions/{name}/activate",
@@ -226,6 +230,16 @@ pub async fn start_server(
         .route(
             "/api/extensions/{name}/remove",
             post(extensions_remove_handler),
+        )
+        .route(
+            "/api/extensions/{name}/setup",
+            get(extensions_setup_handler).post(extensions_setup_submit_handler),
+        )
+        // Pairing
+        .route("/api/pairing/{channel}", get(pairing_list_handler))
+        .route(
+            "/api/pairing/{channel}/approve",
+            post(pairing_approve_handler),
         )
         // Routines
         .route("/api/routines", get(routines_list_handler))
@@ -348,20 +362,32 @@ pub async fn start_server(
 
 // --- Static file handlers ---
 
-async fn index_handler() -> Html<&'static str> {
-    Html(include_str!("static/index.html"))
+async fn index_handler() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        include_str!("static/index.html"),
+    )
 }
 
 async fn css_handler() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "text/css")],
+        [
+            (header::CONTENT_TYPE, "text/css"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
         include_str!("static/style.css"),
     )
 }
 
 async fn js_handler() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "application/javascript")],
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
         include_str!("static/app.js"),
     )
 }
@@ -1692,6 +1718,7 @@ async fn extensions_list_handler(
             authenticated: ext.authenticated,
             active: ext.active,
             tools: ext.tools,
+            needs_setup: ext.needs_setup,
         })
         .collect();
 
@@ -1722,10 +1749,30 @@ async fn extensions_install_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<InstallExtensionRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    let ext_mgr = state.extension_manager.as_ref().ok_or((
-        StatusCode::NOT_IMPLEMENTED,
-        "Extension manager not available (secrets store required)".to_string(),
-    ))?;
+    // When extension manager isn't available, check registry entries for a helpful message
+    let Some(ext_mgr) = state.extension_manager.as_ref() else {
+        // Look up the entry in the catalog to give a specific error
+        if let Some(entry) = state.registry_entries.iter().find(|e| e.name == req.name) {
+            let msg = match &entry.source {
+                crate::extensions::ExtensionSource::WasmBuildable { .. } => {
+                    format!(
+                        "'{}' requires building from source. \
+                         Run `ironclaw registry install {}` from the CLI.",
+                        req.name, req.name
+                    )
+                }
+                _ => format!(
+                    "Extension manager not available (secrets store required). \
+                     Configure DATABASE_URL or a secrets backend to enable installation of '{}'.",
+                    req.name
+                ),
+            };
+            return Ok(Json(ActionResponse::fail(msg)));
+        }
+        return Ok(Json(ActionResponse::fail(
+            "Extension manager not available (secrets store required)".to_string(),
+        )));
+    };
 
     let kind_hint = req.kind.as_deref().and_then(|k| match k {
         "mcp_server" => Some(crate::extensions::ExtensionKind::McpServer),
@@ -1870,6 +1917,160 @@ async fn extensions_remove_handler(
 
     match ext_mgr.remove(&name).await {
         Ok(message) => Ok(Json(ActionResponse::ok(message))),
+        Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
+    }
+}
+
+async fn extensions_registry_handler(
+    State(state): State<Arc<GatewayState>>,
+    Query(params): Query<RegistrySearchQuery>,
+) -> Json<RegistrySearchResponse> {
+    let query = params.query.unwrap_or_default();
+    let query_lower = query.to_lowercase();
+    let tokens: Vec<&str> = query_lower.split_whitespace().collect();
+
+    // Filter registry entries by query (or return all if empty)
+    let matching: Vec<&crate::extensions::RegistryEntry> = if tokens.is_empty() {
+        state.registry_entries.iter().collect()
+    } else {
+        state
+            .registry_entries
+            .iter()
+            .filter(|e| {
+                let name = e.name.to_lowercase();
+                let display = e.display_name.to_lowercase();
+                let desc = e.description.to_lowercase();
+                tokens.iter().any(|t| {
+                    name.contains(t)
+                        || display.contains(t)
+                        || desc.contains(t)
+                        || e.keywords.iter().any(|k| k.to_lowercase().contains(t))
+                })
+            })
+            .collect()
+    };
+
+    // Cross-reference with installed extensions by (name, kind) to avoid
+    // false positives when the same name exists as different kinds.
+    let installed: std::collections::HashSet<(String, String)> =
+        if let Some(ext_mgr) = state.extension_manager.as_ref() {
+            ext_mgr
+                .list(None)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|ext| (ext.name, ext.kind.to_string()))
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
+    let entries = matching
+        .into_iter()
+        .map(|e| {
+            let kind_str = e.kind.to_string();
+            RegistryEntryInfo {
+                name: e.name.clone(),
+                display_name: e.display_name.clone(),
+                installed: installed.contains(&(e.name.clone(), kind_str.clone())),
+                kind: kind_str,
+                description: e.description.clone(),
+                keywords: e.keywords.clone(),
+            }
+        })
+        .collect();
+
+    Json(RegistrySearchResponse { entries })
+}
+
+async fn extensions_setup_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(name): Path<String>,
+) -> Result<Json<ExtensionSetupResponse>, (StatusCode, String)> {
+    let ext_mgr = state.extension_manager.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        "Extension manager not available (secrets store required)".to_string(),
+    ))?;
+
+    let secrets = ext_mgr
+        .get_setup_schema(&name)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let kind = ext_mgr
+        .list(None)
+        .await
+        .ok()
+        .and_then(|list| list.into_iter().find(|e| e.name == name))
+        .map(|e| e.kind.to_string())
+        .unwrap_or_default();
+
+    Ok(Json(ExtensionSetupResponse {
+        name,
+        kind,
+        secrets,
+    }))
+}
+
+async fn extensions_setup_submit_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(name): Path<String>,
+    Json(req): Json<ExtensionSetupRequest>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let ext_mgr = state.extension_manager.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        "Extension manager not available (secrets store required)".to_string(),
+    ))?;
+
+    match ext_mgr.save_setup_secrets(&name, &req.secrets).await {
+        Ok(message) => Ok(Json(ActionResponse::ok(message))),
+        Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
+    }
+}
+
+// --- Pairing handlers ---
+
+async fn pairing_list_handler(
+    Path(channel): Path<String>,
+) -> Result<Json<PairingListResponse>, (StatusCode, String)> {
+    let store = crate::pairing::PairingStore::new();
+    let requests = store
+        .list_pending(&channel)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let infos = requests
+        .into_iter()
+        .map(|r| PairingRequestInfo {
+            code: r.code,
+            sender_id: r.id,
+            meta: r.meta,
+            created_at: r.created_at,
+        })
+        .collect();
+
+    Ok(Json(PairingListResponse {
+        channel,
+        requests: infos,
+    }))
+}
+
+async fn pairing_approve_handler(
+    Path(channel): Path<String>,
+    Json(req): Json<PairingApproveRequest>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let store = crate::pairing::PairingStore::new();
+    match store.approve(&channel, &req.code) {
+        Ok(Some(approved)) => Ok(Json(ActionResponse::ok(format!(
+            "Pairing approved for sender '{}'",
+            approved.id
+        )))),
+        Ok(None) => Ok(Json(ActionResponse::fail(
+            "Invalid or expired pairing code".to_string(),
+        ))),
+        Err(crate::pairing::PairingStoreError::ApproveRateLimited) => Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many failed approve attempts; try again later".to_string(),
+        )),
         Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
     }
 }
