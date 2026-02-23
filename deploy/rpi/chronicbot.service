@@ -1,0 +1,20 @@
+[Unit]
+Description=CHRONICbot AI Assistant
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chronicbot
+Group=chronicbot
+WorkingDirectory=/opt/chronicbot
+EnvironmentFile=/opt/chronicbot/.env
+ExecStart=/opt/chronicbot/bin/ironclaw run
+Restart=always
+RestartSec=5
+WatchdogSec=300
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

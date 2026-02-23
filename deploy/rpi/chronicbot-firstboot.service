@@ -1,0 +1,15 @@
+[Unit]
+Description=CHRONICbot First Boot — Download and Install
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/etc/chronicbot/firstboot.done
+
+[Service]
+Type=oneshot
+ExecStart=/opt/chronicbot/chronicbot-setup.sh --firstboot
+TimeoutStartSec=600
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
