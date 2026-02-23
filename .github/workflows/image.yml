@@ -1,0 +1,58 @@
+name: RPi Image
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-image:
+    runs-on: ubuntu-22.04
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Manual trigger: use latest release tag
+            TAG=$(gh release list --limit 1 --json tagName -q '.[0].tagName')
+          else
+            # workflow_run trigger: use the branch/tag that triggered the release
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Release tag: ${TAG}"
+
+      - name: Build RPi OS image
+        run: |
+          chmod +x deploy/rpi/image/build-image.sh
+          sudo deploy/rpi/image/build-image.sh --output-dir "${{ runner.temp }}/image-out"
+
+      - name: Upload image to GitHub Release
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          IMAGE="${{ runner.temp }}/image-out/chronicbot-rpi4.img.xz"
+
+          if [ ! -f "${IMAGE}" ]; then
+            echo "ERROR: Image not found at ${IMAGE}"
+            ls -la "${{ runner.temp }}/image-out/" || true
+            exit 1
+          fi
+
+          echo "Uploading image to release ${TAG}..."
+          gh release upload "${TAG}" "${IMAGE}" --clobber
+
+          echo "Uploading chronicbot-setup.sh to release ${TAG}..."
+          gh release upload "${TAG}" deploy/rpi/chronicbot-setup.sh --clobber
