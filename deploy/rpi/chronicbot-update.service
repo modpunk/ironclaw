@@ -1,0 +1,10 @@
+[Unit]
+Description=CHRONICbot Auto-Update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/chronicbot/chronicbot-update.sh
+StandardOutput=journal
+StandardError=journal
