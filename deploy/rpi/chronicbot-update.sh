@@ -91,10 +91,10 @@ download_release() {
   curl -sfL -o "${UPDATE_DIR}/checksums.txt" "$checksum_url" \
     || die "Failed to download checksums"
 
-  # Download WASM channel assets (*.wasm)
+  # Download WASM channel assets (*-wasm32-wasip2.tar.gz)
   local wasm_assets
   wasm_assets=$(echo "$RELEASE_JSON" | jq -r \
-    '.assets[] | select(.name | endswith(".wasm")) | .name + "\t" + .browser_download_url')
+    '.assets[] | select(.name | test("wasm32-wasip2.*\\.tar\\.gz$")) | .name + "\t" + .browser_download_url')
 
   if [[ -n "$wasm_assets" ]]; then
     mkdir -p "${UPDATE_DIR}/channels"
@@ -127,16 +127,16 @@ verify_checksums() {
   fi
   log "  ${BINARY_ASSET}: OK"
 
-  # Verify each WASM channel file
+  # Verify each WASM channel tarball
   if [[ -d "${UPDATE_DIR}/channels" ]]; then
-    for wasm_file in "${UPDATE_DIR}/channels"/*.wasm; do
-      [[ -f "$wasm_file" ]] || continue
+    for tarball in "${UPDATE_DIR}/channels"/*-wasm32-wasip2.tar.gz; do
+      [[ -f "$tarball" ]] || continue
       local basename
-      basename=$(basename "$wasm_file")
+      basename=$(basename "$tarball")
       expected=$(grep "$basename" "${UPDATE_DIR}/checksums.txt" | awk '{print $1}')
       [[ -n "$expected" ]] || die "No checksum found for ${basename}"
 
-      actual=$(sha256sum "$wasm_file" | awk '{print $1}')
+      actual=$(sha256sum "$tarball" | awk '{print $1}')
       if [[ "$expected" != "$actual" ]]; then
         die "Checksum mismatch for ${basename}: expected=${expected} actual=${actual}"
       fi
@@ -168,14 +168,27 @@ swap_binaries() {
   # Install new files
   log "Installing new bin/"
   mv "${UPDATE_DIR}/bin" "${INSTALL_DIR}/bin"
+  chown -R chronicbot:chronicbot "${INSTALL_DIR}/bin"
+  chmod +x "${INSTALL_DIR}/bin/"*
 
   if [[ -d "${UPDATE_DIR}/channels" ]]; then
     log "Installing new channels/"
-    mv "${UPDATE_DIR}/channels" "${INSTALL_DIR}/channels"
+    mkdir -p "${INSTALL_DIR}/channels"
+    # Extract each WASM channel tarball
+    for tarball in "${UPDATE_DIR}/channels"/*-wasm32-wasip2.tar.gz; do
+      [[ -f "$tarball" ]] || continue
+      log "Extracting $(basename "$tarball")"
+      tar -xzf "$tarball" -C "${INSTALL_DIR}/channels" \
+        || die "Failed to extract WASM channel: $(basename "$tarball")"
+    done
+    chown -R chronicbot:chronicbot "${INSTALL_DIR}/channels"
   fi
 
   log "Starting chronicbot service"
-  systemctl start chronicbot || die "Failed to start chronicbot"
+  if ! systemctl start chronicbot; then
+    log "Failed to start chronicbot after update — triggering rollback"
+    rollback
+  fi
 }
 
 # ── health_check ─────────────────────────────────────────────────────────
